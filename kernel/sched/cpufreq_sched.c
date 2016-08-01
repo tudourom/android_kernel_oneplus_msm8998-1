@@ -59,11 +59,12 @@ struct gov_tunables {
 struct gov_data {
 	ktime_t up_throttle;
 	ktime_t down_throttle;
-	struct gov_tunables *tunables;
-	struct list_head tunables_hook;
+	unsigned int up_throttle_nsec;
+	unsigned int down_throttle_nsec;
 	struct task_struct *task;
 	struct irq_work irq_work;
 	unsigned int requested_freq;
+	int max;
 };
 
 static void cpufreq_sched_try_driver_target(struct cpufreq_policy *policy,
@@ -77,10 +78,8 @@ static void cpufreq_sched_try_driver_target(struct cpufreq_policy *policy,
 
 	__cpufreq_driver_target(policy, freq, CPUFREQ_RELATION_L);
 
-	gd->up_throttle = ktime_add_ns(ktime_get(),
-				       gd->tunables->up_throttle_nsec);
-	gd->down_throttle = ktime_add_ns(ktime_get(),
-					 gd->tunables->down_throttle_nsec);
+	gd->up_throttle = ktime_add_ns(ktime_get(), gd->up_throttle_nsec);
+	gd->down_throttle = ktime_add_ns(ktime_get(), gd->down_throttle_nsec);
 	up_write(&policy->rwsem);
 }
 
@@ -202,7 +201,7 @@ static void update_fdomain_capacity_request(int cpu)
 	}
 
 	/* Convert the new maximum capacity request into a cpu frequency */
-	freq_new = capacity * policy->max >> SCHED_CAPACITY_SHIFT;
+	freq_new = capacity * gd->max >> SCHED_CAPACITY_SHIFT;
 	if (cpufreq_frequency_table_target(policy, policy->freq_table,
 					   freq_new, CPUFREQ_RELATION_L,
 					   &index_new))
@@ -334,6 +333,12 @@ static struct kobj_type tunables_ktype = {
 	.sysfs_ops = &governor_sysfs_ops,
 };
 
+static struct attribute_group sched_attr_group_gov_pol;
+static struct attribute_group *get_sysfs_attr(void)
+{
+	return &sched_attr_group_gov_pol;
+}
+
 static int cpufreq_sched_policy_init(struct cpufreq_policy *policy)
 {
 	struct gov_data *gd;
@@ -381,6 +386,20 @@ static int cpufreq_sched_policy_init(struct cpufreq_policy *policy)
 		gd->tunables = global_tunables;
 		gov_attr_set_get(&global_tunables->attr_set,
 				 &gd->tunables_hook);
+
+	gd->up_throttle_nsec = policy->cpuinfo.transition_latency ?
+			    policy->cpuinfo.transition_latency :
+			    THROTTLE_UP_NSEC;
+	gd->down_throttle_nsec = THROTTLE_DOWN_NSEC;
+	pr_debug("%s: throttle threshold = %u [ns]\n",
+		  __func__, gd->up_throttle_nsec);
+
+	gd->max = policy->max;
+
+	rc = sysfs_create_group(get_governor_parent_kobj(policy), get_sysfs_attr());
+	if (rc) {
+		pr_err("%s: couldn't create sysfs attributes: %d\n", __func__, rc);
+		goto err;
 	}
 
 	policy->governor_data = gd;
@@ -430,6 +449,8 @@ static int cpufreq_sched_policy_exit(struct cpufreq_policy *policy)
 		kfree(gd->tunables);
 	}
 
+	sysfs_remove_group(get_governor_parent_kobj(policy), get_sysfs_attr());
+
 	policy->governor_data = NULL;
 
 	kfree(gd);
@@ -448,17 +469,28 @@ static int cpufreq_sched_start(struct cpufreq_policy *policy)
 
 static void cpufreq_sched_limits(struct cpufreq_policy *policy)
 {
-	unsigned int clamp_freq;
-	struct gov_data *gd = policy->governor_data;;
+	struct gov_data *gd;
 
 	pr_debug("limit event for cpu %u: %u - %u kHz, currently %u kHz\n",
 		policy->cpu, policy->min, policy->max,
 		policy->cur);
 
-	clamp_freq = clamp(gd->requested_freq, policy->min, policy->max);
+	if (!down_write_trylock(&policy->rwsem))
+		return;
+	/*
+	 * Need to keep track of highest max frequency for
+	 * capacity calculations
+	 */
+	gd = policy->governor_data;
+	if (gd->max < policy->max)
+		gd->max = policy->max;
 
-	if (policy->cur != clamp_freq)
-		__cpufreq_driver_target(policy, clamp_freq, CPUFREQ_RELATION_L);
+	if (policy->max < policy->cur)
+		__cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_H);
+	else if (policy->min > policy->cur)
+		__cpufreq_driver_target(policy, policy->min, CPUFREQ_RELATION_L);
+
+	up_write(&policy->rwsem);
 }
 
 static int cpufreq_sched_stop(struct cpufreq_policy *policy)
@@ -490,6 +522,88 @@ static int cpufreq_sched_setup(struct cpufreq_policy *policy,
 	return 0;
 }
 
+/* Tunables */
+static ssize_t show_up_throttle_nsec(struct gov_data *gd, char *buf)
+{
+	return sprintf(buf, "%u\n", gd->up_throttle_nsec);
+}
+
+static ssize_t store_up_throttle_nsec(struct gov_data *gd,
+		const char *buf, size_t count)
+{
+	int ret;
+	long unsigned int val;
+
+	ret = kstrtoul(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+	gd->up_throttle_nsec = val;
+	return count;
+}
+
+static ssize_t show_down_throttle_nsec(struct gov_data *gd, char *buf)
+{
+	return sprintf(buf, "%u\n", gd->down_throttle_nsec);
+}
+
+static ssize_t store_down_throttle_nsec(struct gov_data *gd,
+		const char *buf, size_t count)
+{
+	int ret;
+	long unsigned int val;
+
+	ret = kstrtoul(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+	gd->down_throttle_nsec = val;
+	return count;
+}
+
+/*
+ * Create show/store routines
+ * - sys: One governor instance for complete SYSTEM
+ * - pol: One governor instance per struct cpufreq_policy
+ */
+#define show_gov_pol_sys(file_name)					\
+static ssize_t show_##file_name##_gov_pol				\
+(struct cpufreq_policy *policy, char *buf)				\
+{									\
+	return show_##file_name(policy->governor_data, buf);		\
+}
+
+#define store_gov_pol_sys(file_name)					\
+static ssize_t store_##file_name##_gov_pol				\
+(struct cpufreq_policy *policy, const char *buf, size_t count)		\
+{									\
+	return store_##file_name(policy->governor_data, buf, count);	\
+}
+
+#define gov_pol_attr_rw(_name)						\
+	static struct freq_attr _name##_gov_pol =				\
+	__ATTR(_name, 0644, show_##_name##_gov_pol, store_##_name##_gov_pol)
+
+#define show_store_gov_pol_sys(file_name)				\
+	show_gov_pol_sys(file_name);						\
+	store_gov_pol_sys(file_name)
+#define tunable_handlers(file_name) \
+	show_gov_pol_sys(file_name); \
+	store_gov_pol_sys(file_name); \
+	gov_pol_attr_rw(file_name)
+
+tunable_handlers(down_throttle_nsec);
+tunable_handlers(up_throttle_nsec);
+
+/* Per policy governor instance */
+static struct attribute *sched_attributes_gov_pol[] = {
+	&up_throttle_nsec_gov_pol.attr,
+	&down_throttle_nsec_gov_pol.attr,
+	NULL,
+};
+
+static struct attribute_group sched_attr_group_gov_pol = {
+	.attrs = sched_attributes_gov_pol,
+	.name = "sched",
+};
 
 #ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_SCHED
 static
