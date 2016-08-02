@@ -431,6 +431,9 @@ static int set_cpu_min_freq(const char *buf, const struct kernel_param *kp)
 	if (touchboost == 0)
 		cp = reset;
 
+	// AP: do not allow min cpu freq to be changed anymore by this driver
+	return 0;
+
 	while ((cp = strpbrk(cp + 1, " :")))
 		ntokens++;
 
@@ -521,6 +524,9 @@ static int set_cpu_max_freq(const char *buf, const struct kernel_param *kp)
 
 	if (touchboost == 0)
 		cp = reset;
+
+	// AP: do not allow max cpu freq to be changed anymore by this driver
+	return 0;
 
 	while ((cp = strpbrk(cp + 1, " :")))
 		ntokens++;
