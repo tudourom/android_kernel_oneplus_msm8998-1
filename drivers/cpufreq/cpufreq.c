@@ -102,9 +102,9 @@ static unsigned int min_freq_hardlimit[2] = {0, 0};
 static unsigned int max_freq_hardlimit[2] = {0, 0};
 
 #define CONFIG_MSM_CPU_FREQ_MIN_GROUP1 175000
-#define CONFIG_MSM_CPU_FREQ_MAX_GROUP1 1900800
+#define CONFIG_MSM_CPU_FREQ_MAX_GROUP1 2035200
 #define CONFIG_MSM_CPU_FREQ_MIN_GROUP2 175000
-#define CONFIG_MSM_CPU_FREQ_MAX_GROUP2 2457600
+#define CONFIG_MSM_CPU_FREQ_MAX_GROUP2 2592000
 
 static inline int map_core_to_cluster(int core)
 {
